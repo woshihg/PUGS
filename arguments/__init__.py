@@ -46,11 +46,15 @@ class ParamGroup:
 
 class ModelParams(ParamGroup): 
     def __init__(self, parser, sentinel=False):
-        self.sh_degree = 3
+        self.sh_degree = 2
         self.feature_dim = 32
         self.init_from_3dgs_pcd = False
         self._source_path = ""
-        self._model_path = ""
+        # 根据当前日期初始化保存的文件夹名称model_path
+        from datetime import datetime
+        now = datetime.now()
+        timestamp = now.strftime("%Y-%m-%d_%H-%M-%S")
+        self._model_path = timestamp
         self._feature_model_path = ""
         self._images = "images"
         self._resolution = -1
