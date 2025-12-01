@@ -20,7 +20,7 @@ import numpy as np
 from random import randint
 from argparse import ArgumentParser, Namespace
 from tqdm import tqdm
-
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.loss_utils import l1_loss, ssim, get_img_grad_weight, zero_one_loss
 from utils.general_utils import safe_state
 from utils.image_utils import psnr, erode
@@ -34,15 +34,23 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, pretrained_gaussians, debug_from):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
+    if pretrained_gaussians:
+        gaussians_path = os.path.join(dataset.source_path, "0000.ply")
+        gaussians.load_ply(gaussians_path, rate=dataset.gaussian_load_rate)
+        print(f"Loaded pretrained gaussians from {gaussians_path}")
+        # 保存采样后的ply文件以供检查
+        sampled_ply_path = os.path.join(scene.model_path, "sampled_pretrained_gaussians.ply")
+        gaussians.save_ply(sampled_ply_path)
+        print(f"Saved sampled pretrained gaussians to {sampled_ply_path}")
     gaussians.training_setup(opt)
-    if checkpoint:
-        (model_params, first_iter) = torch.load(checkpoint)
-        gaussians.restore(model_params, opt)
+    # if checkpoint:
+    #     (model_params, first_iter) = torch.load(checkpoint)
+    #     gaussians.restore(model_params, opt)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -124,6 +132,25 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
+
+            # Compute elapsed time for this iteration (in seconds) using CUDA events
+            try:
+                # Ensure all CUDA work is finished before measuring
+                torch.cuda.synchronize()
+                elapsed_ms = iter_start.elapsed_time(iter_end)
+                elapsed = elapsed_ms / 1000.0
+            except Exception:
+                # Fallback if CUDA timing not available
+                elapsed = 0.0
+
+            # Call training_report safely so failures don't interrupt training
+            try:
+                # renderFunc = render, renderArgs = (pipe, background)
+                training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed,
+                                testing_iterations, scene, render, (pipe, background))
+            except Exception as e:
+                # Don't interrupt training if reporting fails
+                print(f"[WARN] training_report failed at iter {iteration}: {e}")
 
             # Log and save
             if (iteration in saving_iterations):
@@ -224,11 +251,13 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=np.random.randint(10000, 20000))
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[1_000, 2_000, 3_000, 5_000, 7_000, 10_000, 20_000, 30_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[1_000, 2_000, 3_000, 5_000, 7_000, 10_000, 20_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--pretrained_gaussians", action="store_true", help="Use Pretrained Gaussians")
+
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
@@ -240,7 +269,9 @@ if __name__ == "__main__":
     # Start GUI server, configure and run training
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    training(lp.extract(args), op.extract(args), pp.extract(args),
+             args.test_iterations, args.save_iterations, args.checkpoint_iterations,
+             args.start_checkpoint, args.pretrained_gaussians, args.debug_from)
 
     # All done
     print("\nTraining complete.")
