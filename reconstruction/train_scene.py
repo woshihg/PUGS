@@ -27,6 +27,9 @@ from utils.image_utils import psnr, erode
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from scene import Scene, GaussianModel
 from gaussian_renderer import render, network_gui, render_at_plane
+from Difix3D.src.pipeline_difix import DifixPipeline
+from torchvision.transforms import ToPILImage
+from diffusers.utils import load_image
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -48,6 +51,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gaussians.save_ply(sampled_ply_path)
         print(f"Saved sampled pretrained gaussians to {sampled_ply_path}")
     gaussians.training_setup(opt)
+    if pipe.use_fix:
+        difix = DifixPipeline.from_pretrained("nvidia/difix", trust_remote_code=True)
+
     # if checkpoint:
     #     (model_params, first_iter) = torch.load(checkpoint)
     #     gaussians.restore(model_params, opt)
@@ -99,6 +105,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                                     return_plane=iteration > opt.single_view_weight_from_iter,
                                     return_depth_normal=iteration > opt.single_view_weight_from_iter)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+
+        if pipe.use_fix:
+            # image_rgb = image.clone()
+            # if image.max() <= 1.0:
+            #     image_rgb = (image_rgb * 255).byte()
+            # image_rgb = ToPILImage()(image_rgb.cpu())
+            # output_image_path = os.path.join(scene.model_path, f"difix_output_iter_{iteration:05d}.png")
+            # image_rgb.save(output_image_path)
+            image_input = load_image("/home/woshihg/PycharmProjects/PUGS/output/model_2025-12-02_10-47-36/difix_output_iter_00001.png")
+            output_image = difix(prompt="remove degradation", image=image_input, num_inference_steps=1, timesteps=[199], guidance_scale=0.0).images[0]
+            # 保存output_image以供检查
+            output_image_path = os.path.join(scene.model_path, f"difix_fix_iter_{iteration:05d}.png")
+            output_image.save(output_image_path)
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()

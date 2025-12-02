@@ -302,7 +302,7 @@ class GaussianModel:
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
         self._opacity = optimizable_tensors["opacity"]
 
-    def load_ply(self, path, rate=1.0):  # 建议给 rate 一个默认值 1.0
+    def load_ply(self, path, rate=1.0):
         plydata = PlyData.read(path)
 
         # --- 1. 读取所有属性到 Numpy 数组 ---
@@ -320,7 +320,7 @@ class GaussianModel:
         extra_f_names = sorted(extra_f_names, key=lambda x: int(x.split('_')[-1]))
 
         # 这里的 assert 逻辑保留你的原始代码，但建议根据上次讨论进行 SH 阶数自适应修改
-        # assert len(extra_f_names)==3*(self.max_sh_degree + 1) ** 2 - 3
+        assert len(extra_f_names)==3*(self.max_sh_degree + 1) ** 2 - 3
 
         features_extra = np.zeros((xyz.shape[0], len(extra_f_names)))
         for idx, attr_name in enumerate(extra_f_names):
@@ -336,7 +336,7 @@ class GaussianModel:
             scales[:, idx] = np.asarray(plydata.elements[0][attr_name])
 
         # 还原 scale
-        scales = np.exp(scales)
+        # scales = np.exp(scales)
 
         rot_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("rot")]
         rot_names = sorted(rot_names, key=lambda x: int(x.split('_')[-1]))
@@ -377,6 +377,23 @@ class GaussianModel:
 
         self.active_sh_degree = self.max_sh_degree
         self._mask = torch.ones((self._xyz.shape[0],), dtype=torch.float, device="cuda")
+
+        num_points = self._xyz.shape[0]
+        # (A) 修复你的报错：重置 2D 半径记录器
+        self.max_radii2D = torch.zeros((num_points), device="cuda")
+        # (B) 你的 create_from_pcd 里有 max_weight，这里也必须重置
+        self.max_weight = torch.zeros((num_points), device="cuda")
+        # (C) 重置 Mask
+        self._mask = torch.ones((num_points,), dtype=torch.float, device="cuda")
+        # (D) 特别注意：你的初始化代码里有一个 _knn_f
+        # PLY 文件里通常没有这个数据，你需要重新随机初始化它，否则优化器会报错
+        # 必须保证它的第一维也是 num_points
+        knn_f = torch.randn((num_points, 6)).float().cuda()
+        self._knn_f = nn.Parameter(knn_f.requires_grad_(True))
+        # 更新 SH degree
+        self.active_sh_degree = self.max_sh_degree
+
+        print(f"Successfully synced aux buffers (max_radii2D, knn_f, etc.) to {num_points} points.")
     
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}

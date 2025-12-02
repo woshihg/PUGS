@@ -47,6 +47,7 @@ class ParamGroup:
 class ModelParams(ParamGroup): 
     def __init__(self, parser, sentinel=False):
         self.sh_degree = 2
+        self.gaussian_load_rate = 1.0 #导入高斯球的比例
         self.feature_dim = 32
         self.init_from_3dgs_pcd = False
         self._source_path = ""
@@ -54,7 +55,8 @@ class ModelParams(ParamGroup):
         from datetime import datetime
         now = datetime.now()
         timestamp = now.strftime("%Y-%m-%d_%H-%M-%S")
-        self._model_path = timestamp
+        path_root = "/home/woshihg/PycharmProjects/PUGS/output"
+        self._model_path = os.path.join(path_root, f"model_{timestamp}")
         self._feature_model_path = ""
         self._images = "images"
         self._resolution = -1
@@ -78,6 +80,7 @@ class PipelineParams(ParamGroup):
         self.convert_SHs_python = False
         self.compute_cov3D_python = False
         self.debug = False
+        self.use_fix = True
         super().__init__(parser, "Pipeline Parameters")
 
 class OptimizationParams(ParamGroup):

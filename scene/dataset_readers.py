@@ -84,39 +84,106 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, features_fo
 
         extr = cam_extrinsics[key]
         intr = cam_intrinsics[extr.camera_id]
-        height = intr.height
-        width = intr.width
+
+        # ================== 修改 1: 提前读取图片以获取实际分辨率 ==================
+        image_path = os.path.join(images_folder, os.path.basename(extr.name))
+        image_name = os.path.basename(image_path).split(".")[0]
+
+        # 使用 PIL 读取实际图片
+        image = Image.open(image_path)
+        actual_width, actual_height = image.size  # 获取当前图片的真实尺寸
+
+        # 获取 COLMAP 记录的原始尺寸
+        colmap_width = intr.width
+        colmap_height = intr.height
+
+        # 计算缩放比例 (Scale Factor)
+        scale_x = actual_width / colmap_width
+        scale_y = actual_height / colmap_height
+
         uid = intr.id
         R = np.transpose(qvec2rotmat(extr.qvec))
         T = np.array(extr.tvec)
 
-        if intr.model=="SIMPLE_PINHOLE":
-            focal_length_x = intr.params[0]
-            FovY = focal2fov(focal_length_x, height)
-            FovX = focal2fov(focal_length_x, width)
-        elif intr.model=="PINHOLE":
-            focal_length_x = intr.params[0]
-            focal_length_y = intr.params[1]
-            FovY = focal2fov(focal_length_y, height)
-            FovX = focal2fov(focal_length_x, width)
+        # ================== 修改 2: 根据缩放比例调整内参 ==================
+        # 初始化 cx, cy (主点)
+        cx = colmap_width / 2.0
+        cy = colmap_height / 2.0
+
+        if intr.model == "SIMPLE_PINHOLE":
+            # params: [f, cx, cy]
+            raw_f = intr.params[0]
+            raw_cx = intr.params[1]
+            raw_cy = intr.params[2]
+
+            # 缩放
+            focal_length_x = raw_f * scale_x
+            focal_length_y = raw_f * scale_y  # SIMPLE_PINHOLE 只有一个f，通常假设方形像素
+            cx = raw_cx * scale_x
+            cy = raw_cy * scale_y
+
+        elif intr.model == "PINHOLE":
+            # params: [fx, fy, cx, cy]
+            raw_fx = intr.params[0]
+            raw_fy = intr.params[1]
+            raw_cx = intr.params[2]
+            raw_cy = intr.params[3]
+
+            # 缩放
+            focal_length_x = raw_fx * scale_x
+            focal_length_y = raw_fy * scale_y
+            cx = raw_cx * scale_x
+            cy = raw_cy * scale_y
+
         elif intr.model == "SIMPLE_RADIAL":
-            focal_length = intr.params[0]
-            FovY = focal2fov(focal_length, height)
-            FovX = focal2fov(focal_length, width)
+            # params: [f, cx, cy, k]
+            raw_f = intr.params[0]
+            raw_cx = intr.params[1]
+            raw_cy = intr.params[2]
+
+            # 缩放 (SIMPLE_RADIAL 也是单焦距)
+            focal_length_x = raw_f * scale_x
+            focal_length_y = raw_f * scale_y
+            cx = raw_cx * scale_x
+            cy = raw_cy * scale_y
+
         else:
-            assert False, f"Colmap camera model {intr.model} not handled: only undistorted datasets (PINHOLE or SIMPLE_PINHOLE cameras) supported!"
+            assert False, f"Colmap camera model {intr.model} not handled!"
 
-        image_path = os.path.join(images_folder, os.path.basename(extr.name))
-        image_name = os.path.basename(image_path).split(".")[0]
-        image = Image.open(image_path)
+        # ================== 修改 3: 使用缩放后的参数计算 FoV ==================
+        # 注意：这里传入的是 actual_height/width 和 缩放后的 focal_length
+        # 理论上 scale 分子分母会抵消，Fov 不变，但为了数值一致性，使用新数值计算
+        FovY = focal2fov(focal_length_y, actual_height)
+        FovX = focal2fov(focal_length_x, actual_width)
 
-        features = torch.load(os.path.join(features_folder, image_name.split('.')[0] + ".pt")) if features_folder is not None else None
-        masks = torch.load(os.path.join(masks_folder, image_name.split('.')[0] + ".pt")) if masks_folder is not None else None
-        mask_scales = torch.load(os.path.join(mask_scale_folder, image_name.split('.')[0] + ".pt")) if mask_scale_folder is not None else None
+        # 加载其他特征 (保持原逻辑)
+        features = torch.load(
+            os.path.join(features_folder, image_name.split('.')[0] + ".pt")) if features_folder is not None else None
+        masks = torch.load(
+            os.path.join(masks_folder, image_name.split('.')[0] + ".pt")) if masks_folder is not None else None
+        mask_scales = torch.load(os.path.join(mask_scale_folder, image_name.split('.')[
+            0] + ".pt")) if mask_scale_folder is not None else None
 
-        cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image, features=features, masks=masks, mask_scales = mask_scales,
-                              image_path=image_path, image_name=image_name, width=width, height=height, cx=intr.params[2] if len(intr.params) > 3 and allow_principle_point_shift else None, cy=intr.params[3] if len(intr.params) >3 and allow_principle_point_shift else None)
+        # ================== 修改 4: 更新 CameraInfo ==================
+        # 这里的 cx, cy 已经被缩放过了
+        # width, height 传入 actual_width, actual_height
+
+        # 只有当允许主点偏移时，才传入具体的 cx, cy，否则 PyTorch3D/GaussianSplatting 可能默认使用 w/2, h/2
+        final_cx = cx if allow_principle_point_shift else None
+        final_cy = cy if allow_principle_point_shift else None
+
+        cam_info = CameraInfo(
+            uid=uid, R=R, T=T,
+            FovY=FovY, FovX=FovX,
+            image=image,
+            features=features, masks=masks, mask_scales=mask_scales,
+            image_path=image_path, image_name=image_name,
+            width=actual_width, height=actual_height,  # 使用真实尺寸
+            cx=final_cx,
+            cy=final_cy
+        )
         cam_infos.append(cam_info)
+
     sys.stdout.write('\n')
     return cam_infos
 
@@ -483,3 +550,4 @@ sceneLoadTypeCallbacks = {
     "Lerf" : readLerfInfo,
     "ABO": readABOInfo,
 }
+
