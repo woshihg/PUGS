@@ -77,16 +77,20 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, features_fo
     for idx, key in enumerate(cam_extrinsics):
         if idx % 10 >= sample_rate * 10:
             continue
-        sys.stdout.write('\r')
-        # the exact output you're looking for:
-        sys.stdout.write(f"Reading camera {idx+1}/{len(cam_extrinsics)}")
-        sys.stdout.flush()
 
         extr = cam_extrinsics[key]
         intr = cam_intrinsics[extr.camera_id]
 
-        # ================== 修改 1: 提前读取图片以获取实际分辨率 ==================
         image_path = os.path.join(images_folder, os.path.basename(extr.name))
+        if not os.path.exists(image_path):
+            continue
+
+        sys.stdout.write('\r')
+        # the exact output you're looking for:
+        sys.stdout.write(f"Reading camera {idx+1}/{len(cam_extrinsics)} from {images_folder}")
+        sys.stdout.flush()
+
+        # ================== 修改 1: 提前读取图片以获取实际分辨率 ==================
         image_name = os.path.basename(image_path).split(".")[0]
 
         # 使用 PIL 读取实际图片
@@ -229,24 +233,47 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, need_features=False, nee
         cam_extrinsics = read_extrinsics_text(cameras_extrinsic_file)
         cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
 
-    reading_dir = "images" if images == None else images
+    reading_dir = "images" if images is None else images
     feature_dir = "clip_features"
     mask_dir = "sam_masks"
     mask_scale_dir = "mask_scales"
 
-    cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, images_folder=os.path.join(path, reading_dir), features_folder=os.path.join(path, feature_dir) if need_features else None, masks_folder=os.path.join(path, mask_dir) if need_masks else None, mask_scale_folder=os.path.join(path, mask_scale_dir) if need_masks else None, sample_rate=sample_rate, allow_principle_point_shift = allow_principle_point_shift)
+    train_dir = os.path.join(path, reading_dir, "train")
+    test_dir = os.path.join(path, reading_dir, "test")
 
-    if not replica:
-        cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
-    else:
-        cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : int(x.image_name.split("_")[-1]))
+    if os.path.exists(train_dir) and os.path.exists(test_dir):
+        print("Found train/ and test/ subfolders, loading pre-split data.")
 
-    if eval:
-        train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
-        test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
+        print("Reading training cameras...")
+        train_cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, images_folder=train_dir, features_folder=os.path.join(path, feature_dir) if need_features else None, masks_folder=os.path.join(path, mask_dir) if need_masks else None, mask_scale_folder=os.path.join(path, mask_scale_dir) if need_masks else None, sample_rate=sample_rate, allow_principle_point_shift = allow_principle_point_shift)
+
+        print("Reading validation cameras...")
+        test_cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, images_folder=test_dir, features_folder=os.path.join(path, feature_dir) if need_features else None, masks_folder=os.path.join(path, mask_dir) if need_masks else None, mask_scale_folder=os.path.join(path, mask_scale_dir) if need_masks else None, sample_rate=sample_rate, allow_principle_point_shift = allow_principle_point_shift)
+
+        if not replica:
+            train_cam_infos = sorted(train_cam_infos_unsorted, key=lambda x: x.image_name)
+            test_cam_infos = sorted(test_cam_infos_unsorted, key=lambda x: x.image_name)
+        else:
+            train_cam_infos = sorted(train_cam_infos_unsorted, key=lambda x: int(x.image_name.split("_")[-1]))
+            test_cam_infos = sorted(test_cam_infos_unsorted, key=lambda x: int(x.image_name.split("_")[-1]))
+
+        print(f"Dataset loaded: {len(train_cam_infos)} training, {len(test_cam_infos)} validation images.")
+
     else:
-        train_cam_infos = cam_infos
-        test_cam_infos = []
+        print("Did not find train/ and test/ subfolders. Using legacy loading logic.")
+        cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, images_folder=os.path.join(path, reading_dir), features_folder=os.path.join(path, feature_dir) if need_features else None, masks_folder=os.path.join(path, mask_dir) if need_masks else None, mask_scale_folder=os.path.join(path, mask_scale_dir) if need_masks else None, sample_rate=sample_rate, allow_principle_point_shift = allow_principle_point_shift)
+
+        if not replica:
+            cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
+        else:
+            cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : int(x.image_name.split("_")[-1]))
+
+        if eval:
+            train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
+            test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
+        else:
+            train_cam_infos = cam_infos
+            test_cam_infos = []
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
@@ -544,10 +571,89 @@ def readABOInfo(path, white_background, eval, extension=".png"):
                            ply_path=ply_path)
     return scene_info
 
+
+import numpy as np
+from scipy.spatial.transform import Rotation, Slerp
+
+
+def generate_novel_views(camera_list, num_novel_views=10):
+    """
+    在现有相机之间插值生成新的视角。
+
+    :param camera_list: 包含现有 CameraInfo 对象的列表。
+    :param num_novel_views: 要生成的新视角的数量。
+    :return: 包含新生成的 CameraInfo 对象的列表。
+    """
+    if len(camera_list) < 2:
+        print("警告: 无法生成新视角，因为相机数量少于2。")
+        return []
+
+    novel_cameras = []
+    # 获取现有相机的最大 uid，以确保新 uid 不会重复
+    max_uid = max(c.uid for c in camera_list) if camera_list else -1
+
+    print(f"正在生成 {num_novel_views} 个新颖视角...")
+    for i in range(num_novel_views):
+        # 1. 随机选择两个不同的相机进行插值
+        cam_idx1, cam_idx2 = np.random.choice(len(camera_list), 2, replace=False)
+        cam1, cam2 = camera_list[cam_idx1], camera_list[cam_idx2]
+
+        # 2. 插值旋转 (Rotation)
+        # 将旋转矩阵转换为四元数
+        rot1 = Rotation.from_matrix(cam1.R)
+        rot2 = Rotation.from_matrix(cam2.R)
+
+        # 创建 Slerp 插值器
+        key_rots = Rotation.concatenate([rot1, rot2])
+        key_times = [0, 1]
+        slerp = Slerp(key_times, key_rots)
+
+        # 在两个相机之间随机选择一个插值因子
+        interp_factor = np.random.uniform(0.2, 0.8)  # 避免太靠近原始相机
+
+        # 计算插值后的旋转
+        interp_rotation = slerp([interp_factor])[0]
+        R_new = interp_rotation.as_matrix()
+
+        # 3. 插值位置 (Translation)
+        # 首先，计算世界坐标系中的相机中心
+        C1 = -np.dot(cam1.R.T, cam1.T)
+        C2 = -np.dot(cam2.R.T, cam2.T)
+
+        # 对相机中心进行线性插值 (LERP)
+        C_new = (1 - interp_factor) * C1 + interp_factor * C2
+
+        # 使用新的旋转矩阵和相机中心计算新的平移向量 T
+        T_new = -np.dot(R_new, C_new)
+
+        # 4. 创建新的 CameraInfo 对象
+        # 新相机继承第一个相机的内参和图像属性（尽管图像本身不会被使用）
+        new_cam_uid = max_uid + 1 + i
+        novel_cam_info = CameraInfo(
+            uid=new_cam_uid,
+            R=R_new,
+            T=T_new,
+            FovY=cam1.FovY,
+            FovX=cam1.FovX,
+            image=cam1.image,  # 占位符
+            features=None,  # 新视角没有预计算的特征
+            masks=None,  # 新视角没有预计算的掩码
+            mask_scales=None,
+            image_path=f"novel_view_{i}",
+            image_name=f"novel_view_{i}",
+            width=cam1.width,
+            height=cam1.height,
+            cx=cam1.cx,
+            cy=cam1.cy
+        )
+        novel_cameras.append(novel_cam_info)
+
+    print(f"成功生成 {len(novel_cameras)} 个新视角。")
+    return novel_cameras
+
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
     "Blender" : readNerfSyntheticInfo,
     "Lerf" : readLerfInfo,
     "ABO": readABOInfo,
 }
-
