@@ -314,9 +314,10 @@ def run_difix_cycle(scene: Scene, iteration: int, difix_pipe, renderFunc, render
             cx = getattr(viewpoint, "Cx", getattr(viewpoint, "cx", None)),
             cy = getattr(viewpoint, "Cy", getattr(viewpoint, "cy", None)),
         )
+        new_cameras_to_add.append(new_cam_info)
 
-        # Replace existing train camera with same view or add if not present
-        scene.add_train_cameras(new_cam_info)
+    # Replace existing train camera with same view or add if not present
+    scene.add_train_cameras(new_cameras_to_add)
 
 def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
     if tb_writer:
