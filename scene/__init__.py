@@ -13,7 +13,7 @@ import os
 import random
 import json
 from utils.system_utils import searchForMaxIteration
-from scene.dataset_readers import sceneLoadTypeCallbacks, fetchPly
+from scene.dataset_readers import sceneLoadTypeCallbacks, fetchPly, CameraInfo
 from scene.gaussian_model import GaussianModel
 from scene.gaussian_model_ff import FeatureGaussianModel
 from arguments import ModelParams
@@ -140,6 +140,8 @@ class Scene:
             print("Loading Test Cameras")
             self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args)
 
+        self._args = args
+
         # Load or initialize scene / seg gaussians
         if self.loaded_iter and self.gaussians is not None:
             if mode == 'train':
@@ -247,3 +249,26 @@ class Scene:
 
     def getTestCameras(self, scale=1.0):
         return self.test_cameras[scale]
+
+    def get_max_uid(self):
+        """Returns the maximum UID among all cameras."""
+        max_uid = -1
+        for cam_list in self.train_cameras.values():
+            for cam in cam_list:
+                if cam.uid > max_uid:
+                    max_uid = cam.uid
+        for cam_list in self.test_cameras.values():
+            for cam in cam_list:
+                if cam.uid > max_uid:
+                    max_uid = cam.uid
+        return max_uid
+
+    def add_train_cameras(self, new_cam_infos, scale=1.0):
+        """Adds new cameras to the training set."""
+        if scale not in self.train_cameras:
+            self.train_cameras[scale] = []
+        
+        new_cameras = cameraList_from_camInfos(new_cam_infos, scale, self._args)
+        self.train_cameras[scale].extend(new_cameras)
+
+

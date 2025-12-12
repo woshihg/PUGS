@@ -31,7 +31,7 @@ class CameraInfo(NamedTuple):
     T: np.array
     FovY: np.array
     FovX: np.array
-    image: np.array
+    image: any
     features: torch.tensor
     masks: torch.tensor
     mask_scales: torch.tensor

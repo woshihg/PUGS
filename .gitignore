@@ -170,3 +170,5 @@ my_api_key.py
 clip_checkpoint/
 
 .DS_Store
+/data-test/
+/output/

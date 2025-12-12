@@ -10,6 +10,13 @@
 #
 
 import os
+
+# 替换为你的代理地址，注意：
+# 1. 即使是 https 协议，key 也建议全大写
+# 2. 如果是本地代理，通常是 127.0.0.1:端口号
+os.environ["HTTP_PROXY"] = "http://127.0.0.1:7897"
+os.environ["HTTPS_PROXY"] = "http://127.0.0.1:7897"
+
 import sys
 
 import torch
@@ -26,6 +33,7 @@ from utils.general_utils import safe_state
 from utils.image_utils import psnr, erode
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from scene import Scene, GaussianModel
+from scene.dataset_readers import CameraInfo
 from gaussian_renderer import render, network_gui, render_at_plane
 from Difix3D.src.pipeline_difix import DifixPipeline
 from torchvision.transforms import ToPILImage
@@ -47,10 +55,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gaussians.load_ply(gaussians_path, rate=dataset.gaussian_load_rate)
         print(f"Loaded pretrained gaussians from {gaussians_path}")
         # 保存采样后的ply文件以供检查
-        sampled_ply_path = os.path.join(scene.model_path, "sampled_pretrained_gaussians.ply")
-        gaussians.save_ply(sampled_ply_path)
-        print(f"Saved sampled pretrained gaussians to {sampled_ply_path}")
+        # sampled_ply_path = os.path.join(scene.model_path, "sampled_pretrained_gaussians.ply")
+        # gaussians.save_ply(sampled_ply_path)
+        # print(f"Saved sampled pretrained gaussians to {sampled_ply_path}")
     gaussians.training_setup(opt)
+    difix = None
     if pipe.use_fix:
         difix = DifixPipeline.from_pretrained("nvidia/difix", trust_remote_code=True)
 
@@ -106,18 +115,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                                     return_depth_normal=iteration > opt.single_view_weight_from_iter)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
-        if pipe.use_fix:
-            # image_rgb = image.clone()
-            # if image.max() <= 1.0:
-            #     image_rgb = (image_rgb * 255).byte()
-            # image_rgb = ToPILImage()(image_rgb.cpu())
-            # output_image_path = os.path.join(scene.model_path, f"difix_output_iter_{iteration:05d}.png")
-            # image_rgb.save(output_image_path)
-            image_input = load_image("/home/woshihg/PycharmProjects/PUGS/output/model_2025-12-02_10-47-36/difix_output_iter_00001.png")
-            output_image = difix(prompt="remove degradation", image=image_input, num_inference_steps=1, timesteps=[199], guidance_scale=0.0).images[0]
-            # 保存output_image以供检查
-            output_image_path = os.path.join(scene.model_path, f"difix_fix_iter_{iteration:05d}.png")
-            output_image.save(output_image_path)
+        if iteration in testing_iterations:
+            # Run Difix cycle to generate and add new training data
+            if pipe.use_fix:
+                run_difix_cycle(scene, iteration, difix, render, (pipe, background))
+
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
@@ -223,6 +225,99 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
+def run_difix_cycle(scene: Scene, iteration: int, difix_pipe, renderFunc, renderArgs):
+    """
+    Renders all validation views and saves them. Then, loads the saved images,
+    fixes them one by one using Difix, and adds the results to the training set.
+    """
+    if not difix_pipe:
+        return
+
+    val_cameras = scene.getTestCameras()
+    if not val_cameras:
+        print(f"[ITER {iteration}] No validation cameras found, skipping Difix cycle.")
+        return
+
+    render_dir = os.path.join(scene.model_path, "fix", "render")
+    fixed_dir = os.path.join(scene.model_path, "fix", "fixed")
+    os.makedirs(render_dir, exist_ok=True)
+    os.makedirs(fixed_dir, exist_ok=True)
+
+    to_pil = ToPILImage()
+    new_cameras_to_add = []
+    render_items = []
+
+    # Step 1: Render all validation views and save them to disk
+    print(f"\n[ITER {iteration}] Step 1: Rendering {len(val_cameras)} validation views...")
+    for viewpoint in tqdm(val_cameras, desc="Rendering Views"):
+        with torch.no_grad():
+            render_pkg = renderFunc(viewpoint, scene.gaussians, *renderArgs)
+        rendered_image_tensor = torch.clamp(render_pkg["render"], 0.0, 1.0)
+        rendered_image_pil = to_pil(rendered_image_tensor.cpu())
+
+        render_path = os.path.join(render_dir, f"iter_{iteration}_{viewpoint.image_name}.png")
+        rendered_image_pil.save(render_path)
+        render_items.append({"viewpoint": viewpoint, "render_path": render_path})
+
+    # Step 2: Load rendered images, apply Difix, and replace/add to training set
+    print(f"\n[ITER {iteration}] Step 2: Applying Difix to {len(render_items)} rendered views...")
+    for item in tqdm(render_items, desc="Applying Difix"):
+        viewpoint = item["viewpoint"]
+        render_path = item["render_path"]
+
+        # Load the saved rendered image
+        rendered_image_pil = load_image(render_path)
+
+        # Call Difix on the single loaded image
+        try:
+            with torch.no_grad():
+                result = difix_pipe(prompt="remove degradation",
+                                    image=rendered_image_pil,
+                                    num_inference_steps=1,
+                                    timesteps=[199],
+                                    guidance_scale=0.0)
+                fixed_pil = result.images[0]
+                print(f"\n finish fix {render_path}")
+        except Exception as e:
+            print(f"[WARN] Difix failed on view {getattr(viewpoint, 'image_name', 'unknown')}: {e}")
+            continue  # Skip this image if Difix fails
+
+        # Save the fixed image
+        fixed_path = os.path.join(fixed_dir, f"iter_{iteration}_{viewpoint.image_name}.png")
+        fixed_pil.save(fixed_path)
+
+        # Determine uid: prefer to reuse existing train camera uid if same view exists
+        existing_uid = None
+        try:
+            for cam in scene.getTrainCameras():
+                if hasattr(cam, "image_name") and cam.image_name == viewpoint.image_name:
+                    existing_uid = getattr(cam, "uid", None)
+                    break
+        except Exception:
+            existing_uid = None
+
+        new_uid = existing_uid if existing_uid is not None else (scene.get_max_uid() + 1)
+
+        # Construct new CameraInfo (reuse viewpoint intrinsics/poses)
+        new_cam_info = CameraInfo(
+            uid=new_uid,
+            R=viewpoint.R,
+            T=viewpoint.T,
+            FovY=getattr(viewpoint, "FoVy", getattr(viewpoint, "FovY", None)),
+            FovX=getattr(viewpoint, "FoVx", getattr(viewpoint, "FovX", None)),
+            image=fixed_pil,  # Store PIL image directly
+            features=None, masks=None, mask_scales=None,
+            image_path=fixed_path,
+            image_name=viewpoint.image_name,
+            width=getattr(viewpoint, "image_width", getattr(viewpoint, "width", None)),
+            height=getattr(viewpoint, "image_height", getattr(viewpoint, "height", None)),
+            cx = getattr(viewpoint, "Cx", getattr(viewpoint, "cx", None)),
+            cy = getattr(viewpoint, "Cy", getattr(viewpoint, "cy", None)),
+        )
+
+        # Replace existing train camera with same view or add if not present
+        scene.add_train_cameras(new_cam_info)
+
 def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
@@ -249,7 +344,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     l1_test += l1_loss(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
                 psnr_test /= len(config['cameras'])
-                l1_test /= len(config['cameras'])          
+                l1_test /= len(config['cameras'])
                 print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
@@ -259,7 +354,6 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
             tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
             tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
         torch.cuda.empty_cache()
-
 if __name__ == "__main__":
     # Set up command line argument parser
     parser = ArgumentParser(description="Training script parameters")
@@ -270,7 +364,7 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=np.random.randint(10000, 20000))
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[1_000, 2_000, 3_000, 5_000, 7_000, 10_000, 20_000, 30_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[1_0, 2_000, 3_000, 5_000, 7_000, 10_000, 20_000, 30_000])
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[1_000, 2_000, 3_000, 5_000, 7_000, 10_000, 20_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
