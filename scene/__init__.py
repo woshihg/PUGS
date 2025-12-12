@@ -264,11 +264,32 @@ class Scene:
         return max_uid
 
     def add_train_cameras(self, new_cam_infos, scale=1.0):
-        """Adds new cameras to the training set."""
+        """
+        Adds new cameras to the training set.
+        If a camera with the same image_name already exists, it's replaced.
+        Otherwise, the new camera is appended.
+        """
         if scale not in self.train_cameras:
             self.train_cameras[scale] = []
-        
-        new_cameras = cameraList_from_camInfos(new_cam_infos, scale, self._args)
-        self.train_cameras[scale].extend(new_cameras)
 
+        # Create a dictionary for quick lookup of existing cameras by image_name
+        existing_cams_by_name = {cam.image_name: (idx, cam) for idx, cam in enumerate(self.train_cameras[scale])}
 
+        new_cameras_to_append = []
+        for new_cam_info in new_cam_infos:
+            new_camera = cameraList_from_camInfos([new_cam_info], scale, self._args)[0]
+
+            if new_cam_info.image_name in existing_cams_by_name:
+                # Replace existing camera
+                idx_to_replace, old_cam = existing_cams_by_name[new_cam_info.image_name]
+                new_camera.uid = old_cam.uid  # Preserve original UID
+                self.train_cameras[scale][idx_to_replace] = new_camera
+                print(f"Replaced training camera for view: {new_cam_info.image_name}")
+            else:
+                # This camera is new, add it to the list to be appended
+                new_cameras_to_append.append(new_camera)
+
+        if new_cameras_to_append:
+            self.train_cameras[scale].extend(new_cameras_to_append)
+            for cam in new_cameras_to_append:
+                print(f"Added new training camera for view: {cam.image_name}")

@@ -238,8 +238,10 @@ def run_difix_cycle(scene: Scene, iteration: int, difix_pipe, renderFunc, render
         print(f"[ITER {iteration}] No validation cameras found, skipping Difix cycle.")
         return
 
-    render_dir = os.path.join(scene.model_path, "fix", "render")
-    fixed_dir = os.path.join(scene.model_path, "fix", "fixed")
+    # Create iteration-specific directories
+    iter_dir = os.path.join(scene.model_path, "fix", f"iter_{iteration}")
+    render_dir = os.path.join(iter_dir, "render")
+    fixed_dir = os.path.join(iter_dir, "fixed")
     os.makedirs(render_dir, exist_ok=True)
     os.makedirs(fixed_dir, exist_ok=True)
 
@@ -255,7 +257,7 @@ def run_difix_cycle(scene: Scene, iteration: int, difix_pipe, renderFunc, render
         rendered_image_tensor = torch.clamp(render_pkg["render"], 0.0, 1.0)
         rendered_image_pil = to_pil(rendered_image_tensor.cpu())
 
-        render_path = os.path.join(render_dir, f"iter_{iteration}_{viewpoint.image_name}.png")
+        render_path = os.path.join(render_dir, f"{viewpoint.image_name}.png")
         rendered_image_pil.save(render_path)
         render_items.append({"viewpoint": viewpoint, "render_path": render_path})
 
@@ -283,7 +285,7 @@ def run_difix_cycle(scene: Scene, iteration: int, difix_pipe, renderFunc, render
             continue  # Skip this image if Difix fails
 
         # Save the fixed image
-        fixed_path = os.path.join(fixed_dir, f"iter_{iteration}_{viewpoint.image_name}.png")
+        fixed_path = os.path.join(fixed_dir, f"{viewpoint.image_name}.png")
         fixed_pil.save(fixed_path)
 
         # Determine uid: prefer to reuse existing train camera uid if same view exists
@@ -365,8 +367,8 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=np.random.randint(10000, 20000))
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[1_0, 2_000, 3_000, 5_000, 7_000, 10_000, 20_000, 30_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[1_000, 2_000, 3_000, 5_000, 7_000, 10_000, 20_000, 30_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[500, 1_000, 1_500, 2_000, 3_000, 5_000, 7_000, 10_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[500, 1_000, 1_500, 2_000, 3_000, 5_000, 7_000, 10_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
