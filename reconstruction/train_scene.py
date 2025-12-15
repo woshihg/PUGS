@@ -10,7 +10,8 @@
 #
 
 import os
-
+import time
+from pathlib import Path
 # 替换为你的代理地址，注意：
 # 1. 即使是 https 协议，key 也建议全大写
 # 2. 如果是本地代理，通常是 127.0.0.1:端口号
@@ -28,7 +29,7 @@ from random import randint
 from argparse import ArgumentParser, Namespace
 from tqdm import tqdm
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.loss_utils import l1_loss, ssim, get_img_grad_weight, zero_one_loss
+from utils.loss_utils import l1_loss, ssim, get_img_grad_weight, zero_one_loss, LPIPS
 from utils.general_utils import safe_state
 from utils.image_utils import psnr, erode
 from arguments import ModelParams, PipelineParams, OptimizationParams
@@ -62,6 +63,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     difix = None
     if pipe.use_fix:
         difix = DifixPipeline.from_pretrained("nvidia/difix", trust_remote_code=True)
+        difix.to("cuda")
+
+    # Initialize LPIPS metric
+    lpips_metric = LPIPS(net='vgg').to('cuda')
 
     # if checkpoint:
     #     (model_params, first_iter) = torch.load(checkpoint)
@@ -168,7 +173,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             try:
                 # renderFunc = render, renderArgs = (pipe, background)
                 training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed,
-                                testing_iterations, scene, render, (pipe, background))
+                                testing_iterations, scene, render, (pipe, background), lpips_metric)
             except Exception as e:
                 # Don't interrupt training if reporting fails
                 print(f"[WARN] training_report failed at iter {iteration}: {e}")
@@ -269,20 +274,19 @@ def run_difix_cycle(scene: Scene, iteration: int, difix_pipe, renderFunc, render
 
         # Load the saved rendered image
         rendered_image_pil = load_image(render_path)
-
+        reference_image_pil = load_image("/home/woshihg/PycharmProjects/PUGS/data-test/gsnet/images/train/0000.png")
         # Call Difix on the single loaded image
-        try:
-            with torch.no_grad():
-                result = difix_pipe(prompt="remove degradation",
-                                    image=rendered_image_pil,
-                                    num_inference_steps=1,
-                                    timesteps=[199],
-                                    guidance_scale=0.0)
-                fixed_pil = result.images[0]
-                print(f"\n finish fix {render_path}")
-        except Exception as e:
-            print(f"[WARN] Difix failed on view {getattr(viewpoint, 'image_name', 'unknown')}: {e}")
-            continue  # Skip this image if Difix fails
+        with torch.no_grad():
+            result = difix_pipe(prompt="remove degradation",
+                                image=rendered_image_pil,
+                                ref_image=reference_image_pil,
+                                num_inference_steps=1,
+                                timesteps=[199],
+                                guidance_scale=0.0)
+            # 调整输出图像大小以匹配输入
+            fixed_pil = result.images[0]
+            fixed_pil = fixed_pil.resize(rendered_image_pil.size)
+            print(f"\n finish fix {render_path}")
 
         # Save the fixed image
         fixed_path = os.path.join(fixed_dir, f"{viewpoint.image_name}.png")
@@ -321,7 +325,7 @@ def run_difix_cycle(scene: Scene, iteration: int, difix_pipe, renderFunc, render
     # Replace existing train camera with same view or add if not present
     scene.add_train_cameras(new_cameras_to_add)
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, lpips_metric):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
@@ -337,21 +341,28 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
             if config['cameras'] and len(config['cameras']) > 0:
                 l1_test = 0.0
                 psnr_test = 0.0
+                ssim_test = 0.0
+                lpips_test = 0.0
                 for idx, viewpoint in enumerate(config['cameras']):
                     image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
                     if tb_writer and (idx < 5):
                         tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
-                        if iteration == testing_iterations[0]:
-                            tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
+                        tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
                     l1_test += l1_loss(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
+                    ssim_test += ssim(image, gt_image).mean().double()
+                    lpips_test += lpips_metric(image, gt_image).mean().double()
                 psnr_test /= len(config['cameras'])
                 l1_test /= len(config['cameras'])
-                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
+                ssim_test /= len(config['cameras'])
+                lpips_test /= len(config['cameras'])
+                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {} SSIM {} LPIPS {}".format(iteration, config['name'], l1_test, psnr_test, ssim_test, lpips_test))
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
+                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - ssim', ssim_test, iteration)
+                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - lpips', lpips_test, iteration)
 
         if tb_writer:
             tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)

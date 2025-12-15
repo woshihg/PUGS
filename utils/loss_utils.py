@@ -13,6 +13,7 @@ import torch
 import torch.nn.functional as F
 from torch.autograd import Variable
 from math import exp
+import lpips
 
 def l1_loss(network_output, gt):
     return torch.abs((network_output - gt)).mean()
@@ -81,3 +82,14 @@ def zero_one_loss(img):
     val = torch.clamp(img, zero_epsilon, 1 - zero_epsilon)
     loss = torch.mean(torch.log(val) + torch.log(1 - val))
     return loss
+
+class LPIPS(torch.nn.Module):
+    def __init__(self, net='vgg'):
+        super(LPIPS, self).__init__()
+        if lpips is None:
+            raise ImportError("LPIPS library not found. Please install it with 'pip install lpips'")
+        self.lpips_model = lpips.LPIPS(net=net)
+
+    def forward(self, pred, target):
+        # LPIPS expects images in range [-1, 1]
+        return self.lpips_model(pred * 2 - 1, target * 2 - 1)
