@@ -34,6 +34,7 @@ class Scene:
         self.feature_loaded_iter = None
         self.gaussians = gaussians
         self.feature_gaussians = feature_gaussians
+        self.source_path = args.source_path
 
         if load_iteration:
             if load_iteration == -1:
@@ -93,6 +94,7 @@ class Scene:
             
         self.train_cameras = {}
         self.test_cameras = {}
+        self.novel_cameras = {}
 
         if os.path.exists(os.path.join(args.source_path, "sparse")):
         # used for testing lerf transforms,json
@@ -229,6 +231,8 @@ class Scene:
                 print("Initialize feature gaussians from Colmap point cloud")
                 self.feature_gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
 
+    def get_source_path(self):
+        return self.source_path
 
     def save(self, iteration, target='scene'):
         assert target != 'feature' and "Please use save_feature() to save feature gaussians!"
@@ -249,6 +253,32 @@ class Scene:
 
     def getTestCameras(self, scale=1.0):
         return self.test_cameras[scale]
+
+    def getNovelCameras(self, scale=1.0):
+        return self.novel_cameras.get(scale, [])
+
+    def add_novel_cameras(self, new_cameras_info: list, scale: float = 1.0):
+        resolution_scale = scale
+        if resolution_scale not in self.novel_cameras:
+            self.novel_cameras[resolution_scale] = []
+
+        new_cameras = cameraList_from_camInfos(new_cameras_info, resolution_scale, self._args)
+
+        current_cams = self.novel_cameras.get(resolution_scale, [])
+        current_cams_by_name = {cam.image_name: cam for cam in current_cams if hasattr(cam, 'image_name')}
+
+        for new_cam in new_cameras:
+            if hasattr(new_cam, 'image_name') and new_cam.image_name in current_cams_by_name:
+                # Replace existing camera
+                existing_cam = current_cams_by_name[new_cam.image_name]
+                cam_idx = current_cams.index(existing_cam)
+                new_cam.uid = existing_cam.uid  # Preserve UID
+                current_cams[cam_idx] = new_cam
+            else:
+                # Add as a new camera
+                current_cams.append(new_cam)
+
+        self.novel_cameras[resolution_scale] = current_cams
 
     def get_max_uid(self):
         """Returns the maximum UID among all cameras."""

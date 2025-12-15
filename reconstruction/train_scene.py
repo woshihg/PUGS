@@ -32,6 +32,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.loss_utils import l1_loss, ssim, get_img_grad_weight, zero_one_loss, LPIPS
 from utils.general_utils import safe_state
 from utils.image_utils import psnr, erode
+from utils.difix_utils import CameraPoseInterpolator
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from scene import Scene, GaussianModel
 from scene.dataset_readers import CameraInfo
@@ -55,10 +56,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gaussians_path = os.path.join(dataset.source_path, "0000.ply")
         gaussians.load_ply(gaussians_path, rate=dataset.gaussian_load_rate)
         print(f"Loaded pretrained gaussians from {gaussians_path}")
-        # 保存采样后的ply文件以供检查
-        # sampled_ply_path = os.path.join(scene.model_path, "sampled_pretrained_gaussians.ply")
-        # gaussians.save_ply(sampled_ply_path)
-        # print(f"Saved sampled pretrained gaussians to {sampled_ply_path}")
     gaussians.training_setup(opt)
     difix = None
     if pipe.use_fix:
@@ -109,7 +106,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Pick a random Camera
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
-        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+
+        # Alternate between training and novel views
+        if iteration % 2 == 1 and scene.getNovelCameras():
+            novel_viewpoint_stack = scene.getNovelCameras().copy()
+            viewpoint_cam = novel_viewpoint_stack.pop(randint(0, len(novel_viewpoint_stack)-1))
+        else:
+            viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
 
         # Render
         if (iteration - 1) == debug_from:
@@ -230,52 +233,126 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def run_difix_cycle(scene: Scene, iteration: int, difix_pipe, renderFunc, renderArgs):
+def _resolve_image_path(dataset_root, cam):
+    # if image_name present, try to build candidate paths relative to dataset/source_path
+    image_name = getattr(cam, 'image_name', None)
+
+    if image_name:
+        # image_name may already be a relative path or include folders
+        for suffix in ['.png', '.jpg', '.jpeg']:
+            os.path.join(dataset_root, 'images', 'train', image_name + suffix)
+            if os.path.exists(os.path.join(dataset_root, 'images', 'train', image_name + suffix)):
+                return os.path.join(dataset_root, 'images', 'train', image_name + suffix)
+    # Not found
+    return None
+
+def run_difix_cycle(scene: Scene, iteration: int, difix_pipe, renderFunc, renderArgs, shift_distance=0.2):
     """
-    Renders all validation views and saves them. Then, loads the saved images,
-    fixes them one by one using Difix, and adds the results to the training set.
+    Generates novel views by shifting train poses towards test poses, fixes them
+    using Difix, and adds them to a dedicated set of novel cameras in the scene.
     """
     if not difix_pipe:
         return
 
-    val_cameras = scene.getTestCameras()
-    if not val_cameras:
-        print(f"[ITER {iteration}] No validation cameras found, skipping Difix cycle.")
+    train_cameras = scene.getTrainCameras()
+    novel_cameras = scene.getNovelCameras()
+    all_source_cameras = train_cameras + novel_cameras
+
+    test_cameras = scene.getTestCameras()
+
+    if not train_cameras or not test_cameras:
+        print(f"[ITER {iteration}] No training or testing cameras found, skipping novel view generation.")
         return
 
-    # Create iteration-specific directories
+    # Create iteration-specific directories for saving outputs
     iter_dir = os.path.join(scene.model_path, "fix", f"iter_{iteration}")
-    render_dir = os.path.join(iter_dir, "render")
-    fixed_dir = os.path.join(iter_dir, "fixed")
+    render_dir = os.path.join(iter_dir, "render_novel")
+    fixed_dir = os.path.join(iter_dir, "fixed_novel")
     os.makedirs(render_dir, exist_ok=True)
     os.makedirs(fixed_dir, exist_ok=True)
 
+    # --- Step 1: Generate Novel View Poses ---
+    pose_interpolator = CameraPoseInterpolator()
+    train_poses = np.array([w2c_to_c2w(cam.R, cam.T) for cam in train_cameras])
+    all_source_poses = np.array([w2c_to_c2w(cam.R, cam.T) for cam in all_source_cameras])
+    test_poses = np.array([w2c_to_c2w(cam.R, cam.T) for cam in test_cameras])
+
+    # Generate novel poses by shifting from training poses towards testing poses
+    novel_poses = pose_interpolator.shift_poses(all_source_poses, test_poses, distance=shift_distance)
+
+    # --- Step 2: Create Novel Cameras and Render Them ---
     to_pil = ToPILImage()
     new_cameras_to_add = []
     render_items = []
 
-    # Step 1: Render all validation views and save them to disk
-    print(f"\n[ITER {iteration}] Step 1: Rendering {len(val_cameras)} validation views...")
-    for viewpoint in tqdm(val_cameras, desc="Rendering Views"):
+    print(f"\n[ITER {iteration}] Step 1: Rendering {len(novel_poses)} novel views...")
+    for i, novel_pose in enumerate(tqdm(novel_poses, desc="Rendering Novel Views")):
+        # Find the nearest training camera to use as a template for intrinsics
+        assignments = pose_interpolator.find_nearest_assignments(train_poses, [novel_pose])
+        template_cam = train_cameras[assignments[0]]
+
+        # Create a new CameraInfo for the novel view
+
+        R = novel_pose[:3, :3].transpose()
+        T = -R @ novel_pose[:3, 3]
+        novel_cam_info = CameraInfo(
+            uid=-1,  # UID will be assigned later
+            R=R,
+            T=T,
+            FovY=template_cam.FoVy,
+            FovX=template_cam.FoVx,
+            image=None,  # No ground truth image
+            features=None, masks=None, mask_scales=None,
+            image_path=None,
+            image_name=test_cameras[i].image_name,
+            width=template_cam.image_width,
+            height=template_cam.image_height,
+            cx=getattr(template_cam, "cx", None),
+            cy=getattr(template_cam, "cy", None),
+        )
+
+        # Create a full Camera object for rendering
+        from scene.cameras import Camera
+        novel_camera = Camera(
+            uid = None, colmap_id=novel_cam_info.uid, R=novel_cam_info.R, T=novel_cam_info.T,
+            FoVx=novel_cam_info.FovX, FoVy=novel_cam_info.FovY,
+            image_width=novel_cam_info.width, image_height=novel_cam_info.height,
+            image_name=novel_cam_info.image_name, image=None,
+            data_device="cuda"
+        )
+
+        # Render the novel view
         with torch.no_grad():
-            render_pkg = renderFunc(viewpoint, scene.gaussians, *renderArgs)
+            render_pkg = renderFunc(novel_camera, scene.gaussians, *renderArgs)
         rendered_image_tensor = torch.clamp(render_pkg["render"], 0.0, 1.0)
         rendered_image_pil = to_pil(rendered_image_tensor.cpu())
 
-        render_path = os.path.join(render_dir, f"{viewpoint.image_name}.png")
+        render_path = os.path.join(render_dir, f"{novel_camera.image_name}.png")
         rendered_image_pil.save(render_path)
-        render_items.append({"viewpoint": viewpoint, "render_path": render_path})
+        render_items.append({"viewpoint": novel_camera, "render_path": render_path, "novel_pose": novel_pose})
 
-    # Step 2: Load rendered images, apply Difix, and replace/add to training set
-    print(f"\n[ITER {iteration}] Step 2: Applying Difix to {len(render_items)} rendered views...")
-    for item in tqdm(render_items, desc="Applying Difix"):
+    # --- Step 3: Apply Difix to Rendered Novel Views ---
+    train_image_paths = [_resolve_image_path(scene.source_path, cam) for cam in train_cameras]
+
+    print(f"\n[ITER {iteration}] Step 2: Applying Difix to {len(render_items)} rendered novel views...")
+    for item in tqdm(render_items, desc="Applying Difix to Novel Views"):
         viewpoint = item["viewpoint"]
         render_path = item["render_path"]
+        novel_pose = item["novel_pose"]
 
-        # Load the saved rendered image
         rendered_image_pil = load_image(render_path)
-        reference_image_pil = load_image("/home/woshihg/PycharmProjects/PUGS/data-test/gsnet/images/train/0000.png")
-        # Call Difix on the single loaded image
+
+        # Find nearest training camera for reference
+        assignments = pose_interpolator.find_nearest_assignments(train_poses, [novel_pose])
+        ref_image_path = train_image_paths[assignments[0]]
+
+        if ref_image_path is None:
+            print(f"[WARN] Skipping Difix for {viewpoint.image_name} due to missing reference image.")
+            continue
+
+        reference_image_pil = load_image(ref_image_path)
+
+        # Apply Difix
         with torch.no_grad():
             result = difix_pipe(prompt="remove degradation",
                                 image=rendered_image_pil,
@@ -283,47 +360,34 @@ def run_difix_cycle(scene: Scene, iteration: int, difix_pipe, renderFunc, render
                                 num_inference_steps=1,
                                 timesteps=[199],
                                 guidance_scale=0.0)
-            # 调整输出图像大小以匹配输入
-            fixed_pil = result.images[0]
-            fixed_pil = fixed_pil.resize(rendered_image_pil.size)
-            print(f"\n finish fix {render_path}")
+            fixed_pil = result.images[0].resize(rendered_image_pil.size)
 
-        # Save the fixed image
-        fixed_path = os.path.join(fixed_dir, f"{viewpoint.image_name}.png")
+        fixed_path = os.path.join(fixed_dir, f"{viewpoint.image_name}_{iteration}.png")
         fixed_pil.save(fixed_path)
 
-        # Determine uid: prefer to reuse existing train camera uid if same view exists
-        existing_uid = None
-        try:
-            for cam in scene.getTrainCameras():
-                if hasattr(cam, "image_name") and cam.image_name == viewpoint.image_name:
-                    existing_uid = getattr(cam, "uid", None)
-                    break
-        except Exception:
-            existing_uid = None
-
-        new_uid = existing_uid if existing_uid is not None else (scene.get_max_uid() + 1)
-
-        # Construct new CameraInfo (reuse viewpoint intrinsics/poses)
+        # --- Step 4: Prepare CameraInfo to be added to the novel set ---
+        new_uid = scene.get_max_uid() + 1
         new_cam_info = CameraInfo(
             uid=new_uid,
             R=viewpoint.R,
             T=viewpoint.T,
-            FovY=getattr(viewpoint, "FoVy", getattr(viewpoint, "FovY", None)),
-            FovX=getattr(viewpoint, "FoVx", getattr(viewpoint, "FovX", None)),
-            image=fixed_pil,  # Store PIL image directly
+            FovY=viewpoint.FoVy,
+            FovX=viewpoint.FoVx,
+            image=fixed_pil,
             features=None, masks=None, mask_scales=None,
             image_path=fixed_path,
             image_name=viewpoint.image_name,
-            width=getattr(viewpoint, "image_width", getattr(viewpoint, "width", None)),
-            height=getattr(viewpoint, "image_height", getattr(viewpoint, "height", None)),
-            cx = getattr(viewpoint, "Cx", getattr(viewpoint, "cx", None)),
-            cy = getattr(viewpoint, "Cy", getattr(viewpoint, "cy", None)),
+            width=viewpoint.image_width,
+            height=viewpoint.image_height,
+            cx=getattr(viewpoint, "cx", None),
+            cy=getattr(viewpoint, "cy", None),
         )
         new_cameras_to_add.append(new_cam_info)
 
-    # Replace existing train camera with same view or add if not present
-    scene.add_train_cameras(new_cameras_to_add)
+    # Add the newly generated and fixed views to the scene's novel camera set
+    if new_cameras_to_add:
+        scene.add_novel_cameras(new_cameras_to_add)
+        print(f"\n[ITER {iteration}] Added {len(new_cameras_to_add)} new views to the novel camera set.")
 
 def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, lpips_metric):
     if tb_writer:
@@ -368,6 +432,21 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
             tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
             tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
         torch.cuda.empty_cache()
+
+def w2c_to_c2w(R,t):
+    # 2. 计算逆旋转（即 R 的转置）
+    R_inv = R.T
+
+    # 3. 计算新的平移向量
+    t_inv = -np.dot(R_inv, t)
+
+    # 4. 组装成新的 C2W 矩阵
+    c2w_matrix = np.eye(4)
+    c2w_matrix[:3, :3] = R_inv
+    c2w_matrix[:3, 3] = t_inv
+
+    return c2w_matrix
+
 if __name__ == "__main__":
     # Set up command line argument parser
     parser = ArgumentParser(description="Training script parameters")
