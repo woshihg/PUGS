@@ -12,6 +12,7 @@
 import os
 import random
 import json
+import numpy as np
 from utils.system_utils import searchForMaxIteration
 from scene.dataset_readers import sceneLoadTypeCallbacks, fetchPly, CameraInfo
 from scene.gaussian_model import GaussianModel
@@ -263,21 +264,24 @@ class Scene:
             self.novel_cameras[resolution_scale] = []
 
         new_cameras = cameraList_from_camInfos(new_cameras_info, resolution_scale, self._args)
-
         current_cams = self.novel_cameras.get(resolution_scale, [])
-        current_cams_by_name = {cam.image_name: cam for cam in current_cams if hasattr(cam, 'image_name')}
 
         for new_cam in new_cameras:
-            if hasattr(new_cam, 'image_name') and new_cam.image_name in current_cams_by_name:
-                # Replace existing camera
-                existing_cam = current_cams_by_name[new_cam.image_name]
-                cam_idx = current_cams.index(existing_cam)
-                new_cam.uid = existing_cam.uid  # Preserve UID
-                current_cams[cam_idx] = new_cam
-            else:
-                # Add as a new camera
-                current_cams.append(new_cam)
+            found_existing = False
+            for i, existing_cam in enumerate(current_cams):
+                # 通过比较相机外参 (R 和 T) 来判断是否为同一视图
+                # 使用 np.allclose 来处理浮点数比较的精度问题
+                if np.allclose(new_cam.R, existing_cam.R, atol=1e-5) and \
+                        np.allclose(new_cam.T, existing_cam.T, atol=1e-5):
+                    # 发现已存在相同位姿的相机，进行替换
+                    new_cam.uid = existing_cam.uid  # 保持原有的 UID
+                    current_cams[i] = new_cam
+                    found_existing = True
+                    break
 
+            if not found_existing:
+                # 如果是全新的位姿，则添加到列表中
+                current_cams.append(new_cam)
         self.novel_cameras[resolution_scale] = current_cams
 
     def get_max_uid(self):

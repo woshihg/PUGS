@@ -48,6 +48,7 @@ class ModelParams(ParamGroup):
     def __init__(self, parser, sentinel=False):
         self.sh_degree = 2
         self.gaussian_load_rate = 1.0 #导入高斯球的比例
+        self.num_classes = 4 # 类别数量
         self.feature_dim = 32
         self.init_from_3dgs_pcd = False
         self._source_path = ""
@@ -81,11 +82,12 @@ class PipelineParams(ParamGroup):
         self.compute_cov3D_python = False
         self.debug = False
         self.use_fix = False
+        self.use_segmentation = False
         super().__init__(parser, "Pipeline Parameters")
 
 class OptimizationParams(ParamGroup):
     def __init__(self, parser):
-        self.iterations = 30_000
+        self.iterations = 10_000
         self.position_lr_init = 0.00016
         self.position_lr_final = 0.0000016
         self.position_lr_delay_mult = 0.01

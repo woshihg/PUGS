@@ -187,7 +187,6 @@ class CameraPoseInterpolator:
             shifted_pose = np.eye(4)
             shifted_pose[:3, :3] = R_interp
             shifted_pose[:3, 3] = new_translation
-            print("Shifted pose:\n", shifted_pose)
 
             novel_poses.append(shifted_pose)
 

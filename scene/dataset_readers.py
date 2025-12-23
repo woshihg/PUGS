@@ -163,10 +163,24 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, features_fo
         # 加载其他特征 (保持原逻辑)
         features = torch.load(
             os.path.join(features_folder, image_name.split('.')[0] + ".pt")) if features_folder is not None else None
-        masks = torch.load(
-            os.path.join(masks_folder, image_name.split('.')[0] + ".pt")) if masks_folder is not None else None
+        
+        masks = None
+        if masks_folder is not None:
+            mask_path_pt = os.path.join(masks_folder, image_name.split('.')[0] + ".pt")
+            mask_path_png = os.path.join(masks_folder, image_name.split('.')[0] + ".png")
+            if os.path.exists(mask_path_pt):
+                masks = torch.load(mask_path_pt)
+            elif os.path.exists(mask_path_png):
+                mask_image = Image.open(mask_path_png).convert("L")
+                # Resize mask to match image size if necessary
+                if mask_image.size != (actual_width, actual_height):
+                    mask_image = mask_image.resize((actual_width, actual_height), Image.NEAREST)
+                masks = torch.from_numpy(np.array(mask_image)).float() / 255.0
+                if masks.dim() == 2:
+                    masks = masks.unsqueeze(0) # [1, H, W]
+
         mask_scales = torch.load(os.path.join(mask_scale_folder, image_name.split('.')[
-            0] + ".pt")) if mask_scale_folder is not None else None
+            0] + ".pt")) if mask_scale_folder is not None and os.path.exists(os.path.join(mask_scale_folder, image_name.split('.')[0] + ".pt")) else None
 
         # ================== 修改 4: 更新 CameraInfo ==================
         # 这里的 cx, cy 已经被缩放过了
@@ -233,9 +247,11 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, need_features=False, nee
         cam_extrinsics = read_extrinsics_text(cameras_extrinsic_file)
         cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
 
+    print("cam_intrinsics",cam_intrinsics)
+
     reading_dir = "images" if images is None else images
     feature_dir = "clip_features"
-    mask_dir = "sam_masks"
+    mask_dir = "masks"
     mask_scale_dir = "mask_scales"
 
     train_dir = os.path.join(path, reading_dir, "train")

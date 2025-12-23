@@ -57,6 +57,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gaussians.load_ply(gaussians_path, rate=dataset.gaussian_load_rate)
         print(f"Loaded pretrained gaussians from {gaussians_path}")
     gaussians.training_setup(opt)
+
+    if pipe.use_segmentation:
+        num_classes = dataset.num_classes
+        print("Num classes: ",num_classes)
+        classifier = torch.nn.Conv2d(gaussians.num_objects, num_classes, kernel_size=1)
+        cls_criterion = torch.nn.CrossEntropyLoss(reduction='none')
+        cls_optimizer = torch.optim.Adam(classifier.parameters(), lr=5e-4)
+        classifier.cuda()
+
     difix = None
     if pipe.use_fix:
         difix = DifixPipeline.from_pretrained("nvidia/difix", trust_remote_code=True)
@@ -131,8 +140,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
-        Ll1 = l1_loss(image, gt_image)
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+        
+        # Apply mask if available
+        if viewpoint_cam.original_masks is not None:
+            mask = viewpoint_cam.original_masks.cuda()
+            # Ensure mask has same resolution as image
+            if mask.shape[1:] != image.shape[1:]:
+                mask = torch.nn.functional.interpolate(mask.unsqueeze(0), size=image.shape[1:], mode='nearest').squeeze(0)
+            
+            # Masked L1 and SSIM
+            # We use a more robust masked loss by only averaging over the mask
+            mask_sum = mask.sum() + 1e-8
+            Ll1 = (torch.abs(image - gt_image) * mask).sum() / mask_sum
+            # For SSIM, we mask the images. SSIM is window-based, so masking the input is a common approximation.
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image * mask, gt_image * mask))
+        else:
+            Ll1 = l1_loss(image, gt_image)
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
 
         # Geometry_Loss
         if iteration > opt.single_view_weight_from_iter:
@@ -143,11 +167,30 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             image_weight = (image_weight).clamp(0,1).detach() ** 5
             image_weight = erode(image_weight[None,None]).squeeze()
 
+            if viewpoint_cam.original_masks is not None:
+                mask = viewpoint_cam.original_masks.cuda()
+                if mask.shape[1:] != image_weight.shape:
+                    mask = torch.nn.functional.interpolate(mask.unsqueeze(0), size=image_weight.shape, mode='nearest').squeeze()
+                image_weight = image_weight * mask.squeeze()
+
             normal_loss = (image_weight * (((depth_normal - normal)).abs().sum(0))).mean()
-            loss += (opt.lambda_single_view * normal_loss)
+            # loss += (opt.lambda_single_view * normal_loss)
             
         # Sparse Loss
-        loss_01 = zero_one_loss(render_pkg["alpha"])
+        alpha = render_pkg["alpha"]
+        if viewpoint_cam.original_masks is not None:
+            mask = viewpoint_cam.original_masks.cuda()
+            if mask.shape[1:] != alpha.shape[1:]:
+                mask = torch.nn.functional.interpolate(mask.unsqueeze(0), size=alpha.shape[1:], mode='nearest').squeeze(0)
+            
+            mask_bool = mask[0] > 0.5
+            if mask_bool.any():
+                # Index alpha using the 2D mask. If alpha is [C, H, W], result is [C, N]
+                loss_01 = zero_one_loss(alpha[..., mask_bool])
+            else:
+                loss_01 = torch.tensor(0.0, device="cuda")
+        else:
+            loss_01 = zero_one_loss(alpha)
         loss += (opt.lambda_zero_one * loss_01)
 
         loss.backward()
@@ -246,7 +289,7 @@ def _resolve_image_path(dataset_root, cam):
     # Not found
     return None
 
-def run_difix_cycle(scene: Scene, iteration: int, difix_pipe, renderFunc, renderArgs, shift_distance=0.2):
+def run_difix_cycle(scene: Scene, iteration: int, difix_pipe, renderFunc, renderArgs, shift_distance=0.1):
     """
     Generates novel views by shifting train poses towards test poses, fixes them
     using Difix, and adds them to a dedicated set of novel cameras in the scene.
@@ -273,6 +316,7 @@ def run_difix_cycle(scene: Scene, iteration: int, difix_pipe, renderFunc, render
 
     # --- Step 1: Generate Novel View Poses ---
     pose_interpolator = CameraPoseInterpolator()
+    # 插值的时候使用的是相机在世界坐标系下的位姿
     train_poses = np.array([w2c_to_c2w(cam.R, cam.T) for cam in train_cameras])
     all_source_poses = np.array([w2c_to_c2w(cam.R, cam.T) for cam in all_source_cameras])
     test_poses = np.array([w2c_to_c2w(cam.R, cam.T) for cam in test_cameras])
@@ -290,9 +334,7 @@ def run_difix_cycle(scene: Scene, iteration: int, difix_pipe, renderFunc, render
         # Find the nearest training camera to use as a template for intrinsics
         assignments = pose_interpolator.find_nearest_assignments(train_poses, [novel_pose])
         template_cam = train_cameras[assignments[0]]
-
         # Create a new CameraInfo for the novel view
-
         R = novel_pose[:3, :3].transpose()
         T = -R @ novel_pose[:3, 3]
         novel_cam_info = CameraInfo(
@@ -351,6 +393,8 @@ def run_difix_cycle(scene: Scene, iteration: int, difix_pipe, renderFunc, render
             continue
 
         reference_image_pil = load_image(ref_image_path)
+        # 将reference_image_pil 分辨率和 rendered_image_pil 对齐
+        reference_image_pil = reference_image_pil.resize(rendered_image_pil.size)
 
         # Apply Difix
         with torch.no_grad():
@@ -362,7 +406,8 @@ def run_difix_cycle(scene: Scene, iteration: int, difix_pipe, renderFunc, render
                                 guidance_scale=0.0)
             fixed_pil = result.images[0].resize(rendered_image_pil.size)
 
-        fixed_path = os.path.join(fixed_dir, f"{viewpoint.image_name}_{iteration}.png")
+        render_image_name = f"{viewpoint.image_name}_{iteration}"
+        fixed_path = os.path.join(fixed_dir, f"{render_image_name}.png")
         fixed_pil.save(fixed_path)
 
         # --- Step 4: Prepare CameraInfo to be added to the novel set ---
@@ -376,7 +421,7 @@ def run_difix_cycle(scene: Scene, iteration: int, difix_pipe, renderFunc, render
             image=fixed_pil,
             features=None, masks=None, mask_scales=None,
             image_path=fixed_path,
-            image_name=viewpoint.image_name,
+            image_name=render_image_name,
             width=viewpoint.image_width,
             height=viewpoint.image_height,
             cx=getattr(viewpoint, "cx", None),
@@ -457,8 +502,10 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=np.random.randint(10000, 20000))
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[500, 1_000, 1_500, 2_000, 3_000, 5_000, 7_000, 10_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[500, 1_000, 1_500, 2_000, 3_000, 5_000, 7_000, 10_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[500, 1_000, 1_500, 2_000, 2_500, 3_000, 3_500, 4_000, 4_500,
+                                                                           5_000, 5_500, 6_000, 6_500, 7_000, 7_500, 8_000, 8_500, 9_000, 9_500, 10_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[500, 1_000, 1_500, 2_000, 2_500, 3_000, 3_500, 4_000, 4_500,
+                                                                           5_000, 5_500, 6_000, 6_500, 7_000, 7_500, 8_000, 8_500, 9_000, 9_500, 10_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
@@ -466,6 +513,11 @@ if __name__ == "__main__":
 
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
+    
+    # Check if masks directory exists and set need_masks accordingly
+    if os.path.exists(os.path.join(args.source_path, "masks")):
+        args.need_masks = True
+        print("Found masks directory, enabling mask-based optimization.")
     
     print("Optimizing " + args.model_path)
 
