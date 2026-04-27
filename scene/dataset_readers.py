@@ -175,7 +175,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, features_fo
                 # Resize mask to match image size if necessary
                 if mask_image.size != (actual_width, actual_height):
                     mask_image = mask_image.resize((actual_width, actual_height), Image.NEAREST)
-                masks = torch.from_numpy(np.array(mask_image)).float() / 255.0
+                masks = torch.from_numpy(np.array(mask_image)).float()
                 if masks.dim() == 2:
                     masks = masks.unsqueeze(0) # [1, H, W]
 
@@ -247,11 +247,10 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, need_features=False, nee
         cam_extrinsics = read_extrinsics_text(cameras_extrinsic_file)
         cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
 
-    print("cam_intrinsics",cam_intrinsics)
 
     reading_dir = "images" if images is None else images
     feature_dir = "clip_features"
-    mask_dir = "masks"
+    mask_dir = "mask"
     mask_scale_dir = "mask_scales"
 
     train_dir = os.path.join(path, reading_dir, "train")

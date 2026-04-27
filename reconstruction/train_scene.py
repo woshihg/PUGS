@@ -29,17 +29,18 @@ from random import randint
 from argparse import ArgumentParser, Namespace
 from tqdm import tqdm
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.loss_utils import l1_loss, ssim, get_img_grad_weight, zero_one_loss, LPIPS
+from utils.loss_utils import l1_loss, ssim, get_img_grad_weight, zero_one_loss, LPIPS, loss_cls_3d
 from utils.general_utils import safe_state
 from utils.image_utils import psnr, erode
 from utils.difix_utils import CameraPoseInterpolator
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from scene import Scene, GaussianModel
 from scene.dataset_readers import CameraInfo
-from gaussian_renderer import render, network_gui, render_at_plane
+from gaussian_renderer import render, render_at_plane
 from Difix3D.src.pipeline_difix import DifixPipeline
 from torchvision.transforms import ToPILImage
 from diffusers.utils import load_image
+from PIL import Image
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -50,21 +51,30 @@ except ImportError:
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, pretrained_gaussians, debug_from):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
-    gaussians = GaussianModel(dataset.sh_degree)
+    gaussians = GaussianModel(dataset.sh_degree, dataset.num_objects)
     scene = Scene(dataset, gaussians)
     if pretrained_gaussians:
         gaussians_path = os.path.join(dataset.source_path, "0000.ply")
-        gaussians.load_ply(gaussians_path, rate=dataset.gaussian_load_rate)
+        gaussians.load_ply(gaussians_path, rate=dataset.gaussian_load_rate, load_object_features=dataset.load_object_features)
         print(f"Loaded pretrained gaussians from {gaussians_path}")
+    
     gaussians.training_setup(opt)
+    
+    if opt.reset_ff_gs:
+        print("Resetting Gaussian opacity as reset_ff_gs is enabled.")
+        gaussians.reset_opacity()
 
+    classifier = None
+    cls_optimizer = None
+    cls_criterion = None
     if pipe.use_segmentation:
         num_classes = dataset.num_classes
         print("Num classes: ",num_classes)
-        classifier = torch.nn.Conv2d(gaussians.num_objects, num_classes, kernel_size=1)
         cls_criterion = torch.nn.CrossEntropyLoss(reduction='none')
-        cls_optimizer = torch.optim.Adam(classifier.parameters(), lr=5e-4)
-        classifier.cuda()
+        if pipe.use_classifier:
+            classifier = torch.nn.Conv2d(gaussians.num_objects, num_classes, kernel_size=1)
+            cls_optimizer = torch.optim.Adam(classifier.parameters(), lr=5e-4)
+            classifier.cuda()
 
     difix = None
     if pipe.use_fix:
@@ -89,20 +99,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):        
-        if network_gui.conn == None:
-            network_gui.try_connect()
-        while network_gui.conn != None:
-            try:
-                net_image_bytes = None
-                custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
-                if custom_cam != None:
-                    net_image = render(custom_cam, gaussians, pipe, background, scaling_modifer)["render"]
-                    net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
-                network_gui.send(net_image_bytes, dataset.source_path)
-                if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
-                    break
-            except Exception as e:
-                network_gui.conn = None
 
         iter_start.record()
 
@@ -129,7 +125,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         render_pkg = render_at_plane(viewpoint_cam, gaussians, pipe, background,
                                     return_plane=iteration > opt.single_view_weight_from_iter,
-                                    return_depth_normal=iteration > opt.single_view_weight_from_iter)
+                                    return_depth_normal=iteration > opt.single_view_weight_from_iter,
+                                    return_dc=pipe.use_segmentation)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
         if iteration in testing_iterations:
@@ -140,24 +137,56 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
-        
+        loss_obj = None
+        loss_obj_3d = None
         # Apply mask if available
-        if viewpoint_cam.original_masks is not None:
-            mask = viewpoint_cam.original_masks.cuda()
-            # Ensure mask has same resolution as image
-            if mask.shape[1:] != image.shape[1:]:
-                mask = torch.nn.functional.interpolate(mask.unsqueeze(0), size=image.shape[1:], mode='nearest').squeeze(0)
-            
-            # Masked L1 and SSIM
-            # We use a more robust masked loss by only averaging over the mask
-            mask_sum = mask.sum() + 1e-8
-            Ll1 = (torch.abs(image - gt_image) * mask).sum() / mask_sum
-            # For SSIM, we mask the images. SSIM is window-based, so masking the input is a common approximation.
-            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image * mask, gt_image * mask))
-        else:
-            Ll1 = l1_loss(image, gt_image)
-            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+        if pipe.use_segmentation:
+            if viewpoint_cam.original_masks is not None:
+                mask = viewpoint_cam.original_masks.cuda()
+                # Ensure mask has same resolution as image
+                if mask.shape[1:] != image.shape[1:]:
+                    mask = torch.nn.functional.interpolate(mask.unsqueeze(0), size=image.shape[1:], mode='nearest').squeeze(0)
+                object_dc = render_pkg.get("rendered_dc", None)
+                # We use a more robust masked loss by only averaging over the mask
+                if classifier is not None:
+                    logits = classifier(object_dc)
+                else:
+                    logits = object_dc
+                # 统计mask每个类别的点数
+                # for cl in range(num_classes):
+                #     print(f"Class {cl} has {torch.sum((mask == cl).float()).item()} points in the mask.")
+                # # 统计logits每个类别的点数
+                # for cl in range(num_classes):
+                #     print(f"Class {cl} has {torch.sum((logits.argmax(dim=0) == cl).float()).item()} points in the logits.")
 
+                loss_obj = cls_criterion(logits.unsqueeze(0), mask.long()).squeeze(0).mean()
+                loss_obj = loss_obj / torch.log(torch.tensor(num_classes))  # normalize to (0,1)
+
+                # 计算训练步的 mIoU
+                with torch.no_grad():
+                    pred_mask = logits.argmax(dim=0)
+                    ious = []
+                    for cl in range(dataset.num_classes):
+                        intersection = ((pred_mask == cl) & (mask == cl)).sum().item()
+                        union = ((pred_mask == cl) | (mask == cl)).sum().item()
+                        if union > 0:
+                            ious.append(intersection / union)
+                    if len(ious) > 0:
+                        train_mIoU = np.mean(ious)
+                        if tb_writer:
+                            tb_writer.add_scalar('train_loss_patches/miou', train_mIoU, iteration)
+                if iteration % opt.reg3d_interval == 0:
+                    # regularize at certain intervals
+                    if classifier is not None:
+                        logits3d = classifier(gaussians._objects_dc.permute(2,0,1))
+                    else:
+                        logits3d = gaussians._objects_dc.permute(2,0,1)
+                    prob_obj3d = torch.softmax(logits3d,dim=0).squeeze().permute(1,0)
+                    loss_obj_3d = loss_cls_3d(gaussians._xyz.squeeze().detach(), prob_obj3d, opt.reg3d_k, opt.reg3d_lambda_val, opt.reg3d_max_points, opt.reg3d_sample_size)
+                
+        Ll1 = l1_loss(image, gt_image)
+        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image)) + (loss_obj if loss_obj is not None else 0.0) + (loss_obj_3d if loss_obj_3d is not None else 0.0)
+        # if pipe.use_segmentation:
         # Geometry_Loss
         if iteration > opt.single_view_weight_from_iter:
             normal = render_pkg["rendered_normal"]
@@ -174,7 +203,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 image_weight = image_weight * mask.squeeze()
 
             normal_loss = (image_weight * (((depth_normal - normal)).abs().sum(0))).mean()
-            # loss += (opt.lambda_single_view * normal_loss)
+            loss += (opt.lambda_single_view * normal_loss)
             
         # Sparse Loss
         alpha = render_pkg["alpha"]
@@ -200,7 +229,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
+                mean_scale = gaussians.get_scaling.mean().item()
+                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Scale": f"{mean_scale:.{5}f}"})
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
@@ -219,7 +249,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             try:
                 # renderFunc = render, renderArgs = (pipe, background)
                 training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed,
-                                testing_iterations, scene, render, (pipe, background), lpips_metric)
+                                testing_iterations, scene, render_at_plane, (pipe, background, 1.0, None, False, False, pipe.use_segmentation), lpips_metric, loss_obj, loss_obj_3d, pipe, classifier, dataset.num_classes)
             except Exception as e:
                 # Don't interrupt training if reporting fails
                 print(f"[WARN] training_report failed at iter {iteration}: {e}")
@@ -228,6 +258,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
+                if pipe.use_segmentation:
+                    with torch.no_grad():
+                        if classifier is not None:
+                            logits3d = classifier(gaussians._objects_dc.permute(2, 0, 1))
+                        else:
+                            logits3d = gaussians._objects_dc.permute(2, 0, 1)
+                        classes = logits3d.argmax(dim=0).squeeze()
+                        for cl in range(num_classes):
+                            mask = (classes == cl).cpu().numpy()
+                            if mask.any():
+                                point_cloud_path = os.path.join(scene.model_path, "point_cloud/iteration_{}".format(iteration))
+                                gaussians.save_ply(os.path.join(point_cloud_path, f"class_{cl}_point_cloud.ply"), mask=mask)
 
             # Densification
             if iteration < opt.densify_until_iter:
@@ -245,10 +287,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
 
+                if iteration == 100 and opt.reset_ff_gs:
+                    # Prune points with opacity < 0.05
+                    prune_mask = (gaussians.get_opacity < 0.05).squeeze()
+                    if prune_mask.any():
+                        print(f"\n[ITER {iteration}] Pruning {prune_mask.sum().item()} redundant Gaussians (opacity < 0.05)")
+                        gaussians.prune_points(prune_mask)
+
             # Optimizer step
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
+                if pipe.use_segmentation and cls_optimizer is not None:
+                    cls_optimizer.step()
+                    cls_optimizer.zero_grad()
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
@@ -434,10 +486,14 @@ def run_difix_cycle(scene: Scene, iteration: int, difix_pipe, renderFunc, render
         scene.add_novel_cameras(new_cameras_to_add)
         print(f"\n[ITER {iteration}] Added {len(new_cameras_to_add)} new views to the novel camera set.")
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, lpips_metric):
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, lpips_metric, loss_obj=None, loss_obj_3d=None, pipe=None, classifier=None, num_classes=None):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
+        if loss_obj is not None:
+            tb_writer.add_scalar('train_loss_patches/loss_obj', loss_obj.item() if torch.is_tensor(loss_obj) else loss_obj, iteration)
+        if loss_obj_3d is not None:
+            tb_writer.add_scalar('train_loss_patches/loss_obj_3d', loss_obj_3d.item() if torch.is_tensor(loss_obj_3d) else loss_obj_3d, iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
 
     # Report test and samples of training set
@@ -452,26 +508,61 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                 psnr_test = 0.0
                 ssim_test = 0.0
                 lpips_test = 0.0
+                miou_test = 0.0
+                miou_count = 0
                 for idx, viewpoint in enumerate(config['cameras']):
-                    image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
+                    render_pkg = renderFunc(viewpoint, scene.gaussians, *renderArgs)
+                    image = torch.clamp(render_pkg["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+                    
+                    mIoU = None
+                    if pipe and pipe.use_segmentation and viewpoint.original_masks is not None:
+                        rendered_dc = render_pkg.get("rendered_dc", None)
+                        if rendered_dc is not None:
+                            logits = classifier(rendered_dc) if classifier else rendered_dc
+                            pred_mask = logits.argmax(dim=0)
+                            gt_mask = viewpoint.original_masks.cuda().long()
+                            if gt_mask.shape[1:] != pred_mask.shape:
+                                gt_mask = torch.nn.functional.interpolate(gt_mask.unsqueeze(0).float(), size=pred_mask.shape, mode='nearest').squeeze(0).long()
+                            
+                            # Compute mIoU
+                            ious = []
+                            for cl in range(num_classes):
+                                intersection = ((pred_mask == cl) & (gt_mask == cl)).sum().item()
+                                union = ((pred_mask == cl) | (gt_mask == cl)).sum().item()
+                                if union > 0:
+                                    ious.append(intersection / union)
+                            if len(ious) > 0:
+                                mIoU = np.mean(ious)
+
                     if tb_writer and (idx < 5):
                         tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
                         tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
+                    
                     l1_test += l1_loss(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
                     ssim_test += ssim(image, gt_image).mean().double()
                     lpips_test += lpips_metric(image, gt_image).mean().double()
+                    if mIoU is not None:
+                        miou_test += mIoU
+                        miou_count += 1
                 psnr_test /= len(config['cameras'])
                 l1_test /= len(config['cameras'])
                 ssim_test /= len(config['cameras'])
                 lpips_test /= len(config['cameras'])
-                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {} SSIM {} LPIPS {}".format(iteration, config['name'], l1_test, psnr_test, ssim_test, lpips_test))
+                print_str = "\n[ITER {}] Evaluating {}: L1 {} PSNR {} SSIM {} LPIPS {}".format(iteration, config['name'], l1_test, psnr_test, ssim_test, lpips_test)
+                if miou_count > 0:
+                    miou_test /= miou_count
+                    print_str += " mIoU {}".format(miou_test)
+                print(print_str)
+                
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - ssim', ssim_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - lpips', lpips_test, iteration)
+                    if miou_count > 0:
+                        tb_writer.add_scalar(config['name'] + '/loss_viewpoint - miou', miou_test, iteration)
 
         if tb_writer:
             tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
@@ -503,21 +594,26 @@ if __name__ == "__main__":
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[500, 1_000, 1_500, 2_000, 2_500, 3_000, 3_500, 4_000, 4_500,
-                                                                           5_000, 5_500, 6_000, 6_500, 7_000, 7_500, 8_000, 8_500, 9_000, 9_500, 10_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[500, 1_000, 1_500, 2_000, 2_500, 3_000, 3_500, 4_000, 4_500,
-                                                                           5_000, 5_500, 6_000, 6_500, 7_000, 7_500, 8_000, 8_500, 9_000, 9_500, 10_000])
+                                                                           5_000, 5_500, 6_000, 6_500, 7_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--pretrained_gaussians", action="store_true", help="Use Pretrained Gaussians")
+    parser.add_argument("--output_dir", type=str, default=None, help="Output directory")
 
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
-    # Check if masks directory exists and set need_masks accordingly
-    if os.path.exists(os.path.join(args.source_path, "masks")):
+    if args.output_dir is not None:
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        args.model_path = os.path.join(args.output_dir, f"model_{timestamp}")
+    
+    # Check if mask directory exists and set need_masks accordingly
+    if os.path.exists(os.path.join(args.source_path, "mask")):
         args.need_masks = True
-        print("Found masks directory, enabling mask-based optimization.")
+        print("Found mask directory, enabling mask-based optimization.")
     
     print("Optimizing " + args.model_path)
 
@@ -525,7 +621,6 @@ if __name__ == "__main__":
     safe_state(args.quiet)
 
     # Start GUI server, configure and run training
-    network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     training(lp.extract(args), op.extract(args), pp.extract(args),
              args.test_iterations, args.save_iterations, args.checkpoint_iterations,

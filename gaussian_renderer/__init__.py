@@ -468,7 +468,7 @@ def render_normal(viewpoint_cam, depth, offset=None, normal=None, scale=1):
     normal_ref = normal_ref.permute(2,0,1)
     return normal_ref
 
-def render_at_plane(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, return_plane = True, return_depth_normal = True):
+def render_at_plane(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, return_plane = True, return_depth_normal = True, return_dc = False):
     """
     Render the scene. 
     
@@ -555,7 +555,7 @@ def render_at_plane(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch
     )
     rasterizer_alpha = GaussianRasterizer(raster_settings=raster_settings_alpha)
     alpha = torch.ones_like(means3D) 
-    rendered_alpha = rasterizer_alpha(
+    rendered_alpha_pkg = rasterizer_alpha(
         means3D = means3D,
         means2D = means2D,
         shs = None,
@@ -563,7 +563,8 @@ def render_at_plane(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch
         opacities = opacity,
         scales = scales,
         rotations = rotations,
-        cov3D_precomp = cov3D_precomp)[0]
+        cov3D_precomp = cov3D_precomp)
+    rendered_alpha = rendered_alpha_pkg[0]
 
     if not return_plane:
         rendered_image, radii, out_observe, _, _ = rasterizer(
@@ -584,6 +585,9 @@ def render_at_plane(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch
                         "radii": radii,
                         "out_observe": out_observe,
                         "alpha": rendered_alpha}
+        if return_dc:
+            rendered_dc = render_with_dc(viewpoint_camera, pc, pipe, bg_color, scaling_modifier, override_color)
+            return_dict.update({"rendered_dc": rendered_dc["render_object"]})
         return return_dict
 
     global_normal = pc.get_normal(viewpoint_camera)
@@ -627,6 +631,9 @@ def render_at_plane(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch
     if return_depth_normal:
         depth_normal = render_normal(viewpoint_camera, plane_depth.squeeze()) * (rendered_alpha).detach()
         return_dict.update({"depth_normal": depth_normal})
+    if return_dc:
+        rendered_dc = render_with_dc(viewpoint_camera, pc, pipe, bg_color, scaling_modifier, override_color)
+        return_dict.update({"rendered_dc": rendered_dc["render_object"]})
     
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.

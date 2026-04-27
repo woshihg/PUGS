@@ -15,8 +15,11 @@ import torch.nn.functional as F
 def mse(img1, img2):
     return (((img1 - img2)) ** 2).view(img1.shape[0], -1).mean(1, keepdim=True)
 
-def psnr(img1, img2):
-    mse = (((img1 - img2)) ** 2).view(img1.shape[0], -1).mean(1, keepdim=True)
+def psnr(img1, img2, mask=None):
+    if mask is not None:
+        mse = (((img1 - img2) * mask) ** 2).view(img1.shape[0], -1).sum(1, keepdim=True) / (mask.view(mask.shape[0], -1).sum(1, keepdim=True) + 1e-7)
+    else:
+        mse = (((img1 - img2)) ** 2).view(img1.shape[0], -1).mean(1, keepdim=True)
     return 20 * torch.log10(1.0 / torch.sqrt(mse))
 
 def dilate(bin_img, ksize=5):

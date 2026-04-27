@@ -71,7 +71,7 @@ class GaussianModel:
 
         self.rotation_activation = torch.nn.functional.normalize
 
-    def __init__(self, sh_degree : int):
+    def __init__(self, sh_degree : int, num_objects : int = 16):
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree  
         self._xyz = torch.empty(0)
@@ -83,7 +83,7 @@ class GaussianModel:
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
         self._objects_dc = torch.empty(0)
-        self.num_objects = 16
+        self.num_objects = num_objects
 
         self.max_radii2D = torch.empty(0)
         self.max_weight = torch.empty(0)
@@ -302,6 +302,15 @@ class GaussianModel:
         rotation = self._rotation.detach().cpu().numpy()
         obj_dc = self._objects_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
 
+        if mask is not None:
+            xyz = xyz[mask]
+            normals = normals[mask]
+            f_dc = f_dc[mask]
+            f_rest = f_rest[mask]
+            opacities = opacities[mask]
+            scale = scale[mask]
+            rotation = rotation[mask]
+            obj_dc = obj_dc[mask]
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
@@ -321,7 +330,7 @@ class GaussianModel:
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
         self._opacity = optimizable_tensors["opacity"]
 
-    def load_ply(self, path, rate=1.0):
+    def load_ply(self, path, rate=1.0, load_object_features=True):
         plydata = PlyData.read(path)
 
         # --- 1. 读取所有属性到 Numpy 数组 ---
@@ -354,14 +363,30 @@ class GaussianModel:
         for idx, attr_name in enumerate(scale_names):
             scales[:, idx] = np.asarray(plydata.elements[0][attr_name])
 
-        # 还原 scale
-        # scales = np.exp(scales)
-
         rot_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("rot")]
         rot_names = sorted(rot_names, key=lambda x: int(x.split('_')[-1]))
         rots = np.zeros((xyz.shape[0], len(rot_names)))
         for idx, attr_name in enumerate(rot_names):
             rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
+
+        # --- [新增] 读取物体特征 (obj_dc) ---
+        # 兼容两种命名：obj_dc_ 或 feature_
+        obj_dc_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("obj_dc_")]
+        if len(obj_dc_names) == 0:
+            obj_dc_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("feature_")]
+
+        if len(obj_dc_names) > 0 and load_object_features:
+            obj_dc_names = sorted(obj_dc_names, key=lambda x: int(x.split('_')[-1]))
+            objects_dc = np.zeros((xyz.shape[0], len(obj_dc_names), 1))
+            for idx, attr_name in enumerate(obj_dc_names):
+                objects_dc[:, idx, 0] = np.asarray(plydata.elements[0][attr_name])
+        else:
+            # 如果 PLY 中没有物体特征，或者显式禁用读取，则初始化为全 0
+            if not load_object_features:
+                print("Object features loading is disabled, initializing with zeros.")
+            else:
+                print("No object features found in PLY, initializing with zeros.")
+            objects_dc = np.zeros((xyz.shape[0], self.num_objects, 1))
 
         # --- 2. [新增] 按照 rate 进行随机抽样 ---
         if 0 < rate < 1.0:
@@ -379,12 +404,10 @@ class GaussianModel:
             opacities = opacities[indices]
             scales = scales[indices]
             rots = rots[indices]
+            objects_dc = objects_dc[indices]
 
         # --- 3. 转换为 Tensor ---
         print("Number of Gaussians loaded into VRAM: ", xyz.shape[0])
-        objects_dc = np.zeros((xyz.shape[0], self.num_objects, 1))
-        for idx in range(self.num_objects):
-            objects_dc[:,idx,0] = np.asarray(plydata.elements[0]["obj_dc_"+str(idx)])
 
         self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True))
         self._features_dc = nn.Parameter(
@@ -422,12 +445,15 @@ class GaussianModel:
         for group in self.optimizer.param_groups:
             if group["name"] == name:
                 stored_state = self.optimizer.state.get(group['params'][0], None)
-                stored_state["exp_avg"] = torch.zeros_like(tensor)
-                stored_state["exp_avg_sq"] = torch.zeros_like(tensor)
+                if stored_state is not None:
+                    stored_state["exp_avg"] = torch.zeros_like(tensor)
+                    stored_state["exp_avg_sq"] = torch.zeros_like(tensor)
 
-                del self.optimizer.state[group['params'][0]]
-                group["params"][0] = nn.Parameter(tensor.requires_grad_(True))
-                self.optimizer.state[group['params'][0]] = stored_state
+                    del self.optimizer.state[group['params'][0]]
+                    group["params"][0] = nn.Parameter(tensor.requires_grad_(True))
+                    self.optimizer.state[group['params'][0]] = stored_state
+                else:
+                    group["params"][0] = nn.Parameter(tensor.requires_grad_(True))
 
                 optimizable_tensors[group["name"]] = group["params"][0]
         return optimizable_tensors

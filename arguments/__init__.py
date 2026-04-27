@@ -49,7 +49,9 @@ class ModelParams(ParamGroup):
         self.sh_degree = 2
         self.gaussian_load_rate = 1.0 #导入高斯球的比例
         self.num_classes = 4 # 类别数量
+        self.num_objects = 16
         self.feature_dim = 32
+        self.load_object_features = False # 是否读取物体特征
         self.init_from_3dgs_pcd = False
         self._source_path = ""
         # 根据当前日期初始化保存的文件夹名称model_path
@@ -83,11 +85,12 @@ class PipelineParams(ParamGroup):
         self.debug = False
         self.use_fix = False
         self.use_segmentation = False
+        self.use_classifier = False
         super().__init__(parser, "Pipeline Parameters")
 
 class OptimizationParams(ParamGroup):
     def __init__(self, parser):
-        self.iterations = 10_000
+        self.iterations = 7_000
         self.position_lr_init = 0.00016
         self.position_lr_final = 0.0000016
         self.position_lr_delay_mult = 0.01
@@ -99,7 +102,7 @@ class OptimizationParams(ParamGroup):
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
         self.densification_interval = 100
-        self.opacity_reset_interval = 3000
+        self.opacity_reset_interval = 1000
         self.densify_from_iter = 500
         self.densify_until_iter = 15_000
         self.densify_grad_threshold = 0.0002
@@ -126,10 +129,19 @@ class OptimizationParams(ParamGroup):
         self.single_view_weight_from_iter = 7000
 
         self.opacity_cull_threshold = 0.005
-        self.densify_abs_grad_threshold = 0.0008
+        self.densify_abs_grad_threshold = 0.008
         self.abs_split_radii2D_threshold = 20
         self.max_abs_split_points = 50_000
-        self.max_all_points = 6000_000   
+        self.max_all_points = 6_000_000   
+
+        # segmentation
+        self.reg3d_interval = 2
+        self.reg3d_k = 5
+        self.reg3d_lambda_val = 2
+        self.reg3d_max_points = 300000
+        self.reg3d_sample_size = 1000
+
+        self.reset_ff_gs = True
 
         super().__init__(parser, "Optimization Parameters")
 
