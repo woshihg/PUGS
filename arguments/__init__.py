@@ -51,7 +51,7 @@ class ModelParams(ParamGroup):
         self.num_classes = 4 # 类别数量
         self.num_objects = 16
         self.feature_dim = 32
-        self.load_object_features = False # 是否读取物体特征
+        self.load_object_features = True # 是否读取物体特征
         self.init_from_3dgs_pcd = False
         self._source_path = ""
         # 根据当前日期初始化保存的文件夹名称model_path

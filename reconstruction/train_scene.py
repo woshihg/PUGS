@@ -185,7 +185,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     loss_obj_3d = loss_cls_3d(gaussians._xyz.squeeze().detach(), prob_obj3d, opt.reg3d_k, opt.reg3d_lambda_val, opt.reg3d_max_points, opt.reg3d_sample_size)
                 
         Ll1 = l1_loss(image, gt_image)
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image)) + (loss_obj if loss_obj is not None else 0.0) + (loss_obj_3d if loss_obj_3d is not None else 0.0)
+        # loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image)) + (loss_obj if loss_obj is not None else 0.0) + (loss_obj_3d if loss_obj_3d is not None else 0.0)
+        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image)) + (loss_obj_3d if loss_obj_3d is not None else 0.0)
         # if pipe.use_segmentation:
         # Geometry_Loss
         if iteration > opt.single_view_weight_from_iter:
